@@ -8,6 +8,20 @@ A local web-based viewer for browsing and analyzing [Claude Code](https://docs.a
 ![No Dependencies](https://img.shields.io/badge/dependencies-none-green)
 ![License: MIT](https://img.shields.io/badge/license-MIT-yellow)
 
+## Screenshots
+
+**API View** — Request/response pairs with token usage per API call
+![API View](screenshots/readme_api_view.png)
+
+**Stats** — Token totals, tool usage distribution, cost trend chart
+![Stats View](screenshots/readme_stats_view.png)
+
+**Chat View** — Color-coded conversation with compact detection
+![Chat View](screenshots/readme_chat_view.png)
+
+**Timeline** — Horizontal interactive timeline with zoom and drag
+![Timeline View](screenshots/readme_timeline_view.png)
+
 ## Quick Start
 
 ```bash
