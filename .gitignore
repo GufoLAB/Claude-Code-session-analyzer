@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+.claude/
+
+# Old files (not part of the project)
+session_viewer.py
+session_viewer.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
