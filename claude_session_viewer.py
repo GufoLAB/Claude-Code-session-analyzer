@@ -23,6 +23,84 @@ BASE_DIR = os.environ.get(
 LOCAL_TZ_OFFSET = int(os.environ.get("CSV_TZ_OFFSET", 8))  # default UTC+8
 TW = timezone(timedelta(hours=LOCAL_TZ_OFFSET))
 
+# ─── Project Path Decoding ───
+_path_cache = {}
+_dir_listing_cache = {}
+
+def _list_dir_cached(dirpath):
+    """List directory contents with caching."""
+    if dirpath not in _dir_listing_cache:
+        try:
+            _dir_listing_cache[dirpath] = os.listdir(dirpath)
+        except Exception:
+            _dir_listing_cache[dirpath] = []
+    return _dir_listing_cache[dirpath]
+
+def _normalize(name):
+    """Normalize a filename the same way Claude Code encodes path segments.
+
+    Replaces '/', '_', and non-ASCII chars each with '-'."""
+    out = []
+    for ch in name:
+        if ch == '/' or ch == '_' or ord(ch) > 127:
+            out.append('-')
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+def decode_project_folder(encoded_name):
+    """Decode Claude Code project folder name back to the real filesystem path.
+
+    Claude Code encodes: '/' → '-', '_' → '-', non-ASCII → '-' (per char).
+    We reconstruct by listing actual directory entries and matching their
+    normalized form against the encoded segments.
+    """
+    if encoded_name in _path_cache:
+        return _path_cache[encoded_name]
+
+    # Strip leading '-' (represents the root '/')
+    raw = encoded_name.lstrip("-")
+    if not raw:
+        _path_cache[encoded_name] = "/"
+        return "/"
+
+    parts = raw.split("-")
+    result_segments = []
+    i = 0
+    current_path = "/"
+
+    while i < len(parts):
+        entries = _list_dir_cached(current_path)
+        # Build a lookup: normalized_name → actual_name
+        norm_map = {}
+        for entry in entries:
+            norm = _normalize(entry)
+            norm_map[norm] = entry
+
+        # Try longest segment match first
+        best = None
+        for j in range(len(parts), i, -1):
+            candidate_norm = "-".join(parts[i:j])
+            if candidate_norm in norm_map:
+                actual_name = norm_map[candidate_norm]
+                candidate_path = os.path.join(current_path, actual_name)
+                if os.path.exists(candidate_path):
+                    best = (actual_name, candidate_path, j)
+                    break
+        if best:
+            result_segments.append(best[0])
+            current_path = best[1]
+            i = best[2]
+        else:
+            # No match — use raw segment as-is
+            result_segments.append(parts[i])
+            current_path = os.path.join(current_path, parts[i])
+            i += 1
+
+    decoded = "/" + "/".join(result_segments)
+    _path_cache[encoded_name] = decoded
+    return decoded
+
 # ─── Compact Detection ───
 COMPACT_PATTERNS = [
     (r'壓縮進度紀錄|Curator 壓縮於', 'curator', 'Curator 壓縮紀錄'),
@@ -93,39 +171,70 @@ def compact_badges(compacts):
 
 
 def get_session_summary(filepath):
-    """Quick scan: get first user message preview + timestamp + record count + compact info."""
+    """Quick scan: read first 5 lines for preview/model/timestamp, tail 2KB for last_ts.
+
+    Optimized for speed — reads only what's needed for sidebar display.
+    """
     first_user = ""
     first_ts = ""
     last_ts = ""
-    count = 0
     model = ""
     has_compact = False
     compact_count = 0
+    count = 0
+
     try:
+        fsize = os.path.getsize(filepath)
+
+        # Read first 5 lines (enough for preview + model)
         with open(filepath) as f:
-            for line in f:
-                count += 1
-                r = json.loads(line)
+            for i, line in enumerate(f):
+                if i >= 5:
+                    break
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
                 ts = r.get("timestamp", "")
                 if ts and not first_ts:
                     first_ts = ts
-                if ts:
-                    last_ts = ts
-                if r.get("type") == "user":
+                if r.get("type") == "user" and not first_user:
                     msg = r.get("message", {})
                     c = msg.get("content", "")
-                    raw = c if isinstance(c, str) else str(c)
-                    if not first_user:
-                        if isinstance(c, list):
-                            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
-                        first_user = str(c)[:120].replace("\n", " ")
-                    if detect_compact(raw):
-                        has_compact = True
-                        compact_count += 1
+                    if isinstance(c, list):
+                        c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                    first_user = str(c)[:50].replace("\n", " ")
                 if r.get("type") == "assistant" and not model:
                     model = r.get("message", {}).get("model", "")
+
+        # Read last 2KB for last_ts
+        with open(filepath, "rb") as fb:
+            fb.seek(max(0, fsize - 2048))
+            tail = fb.read().decode("utf-8", errors="replace")
+        for tline in reversed(tail.strip().split("\n")):
+            try:
+                r = json.loads(tline)
+                ts = r.get("timestamp", "")
+                if ts:
+                    last_ts = ts
+                    break
+            except Exception:
+                continue
+
+        # Estimate record count from file size + newline count in tail
+        # Fast: count newlines in 64KB sample from middle
+        sample_size = min(fsize, 65536)
+        with open(filepath, "rb") as fb:
+            sample = fb.read(sample_size)
+        nl_count = sample.count(b"\n")
+        if nl_count > 0 and sample_size > 0:
+            count = max(nl_count, int(fsize * nl_count / sample_size))
+        else:
+            count = 1
+
     except Exception:
         pass
+
     return {
         "preview": first_user or "(empty)",
         "start": fmt_date(first_ts),
@@ -137,13 +246,31 @@ def get_session_summary(filepath):
     }
 
 
-def render_session(filepath):
-    """Render a session JSONL into HTML entries."""
+def render_session(filepath, offset=0, limit=0):
+    """Render a session JSONL into HTML entries.
+
+    Args:
+        offset: skip first N records (for pagination)
+        limit: max records to render (0 = all)
+    Returns: (html, rendered_count, compact_total, total_records)
+    """
+    # Only parse the lines we need (skip/limit) to avoid loading entire file
+    records = []
+    total_records = 0
+    end = offset + limit if limit > 0 else float('inf')
     with open(filepath) as f:
-        records = [json.loads(line) for line in f]
+        for i, line in enumerate(f):
+            total_records = i + 1
+            if i < offset:
+                continue
+            if i >= end:
+                # Still need to count remaining lines
+                total_records += sum(1 for _ in f)
+                break
+            records.append(json.loads(line))
 
     parts = []
-    eid = 0
+    eid = offset  # continue numbering from offset
     compact_total = 0
     for r in records:
         rtype = r.get("type", "")
@@ -260,7 +387,7 @@ def render_session(filepath):
                     parts.append(f'<div class="entry progress hidden-default" data-type="progress" data-compact="0" id="e{eid}"><span class="tag tag-progress">AGENT</span><span class="time">{ts}</span><details><summary>{esc(preview)}…</summary><div class="content">{esc(str(content))}</div></details></div>')
                     eid += 1
 
-    return "\n".join(parts), eid, compact_total
+    return "\n".join(parts), eid - offset, compact_total, total_records
 
 
 def render_api_view(filepath):
@@ -631,6 +758,7 @@ def search_sessions(query, folder=None):
                             match_text = text[idx:idx + len(query)]
                             results.append({
                                 "folder": fname,
+                                "readable_folder": decode_project_folder(fname),
                                 "filename": jf,
                                 "session_id": jf.replace(".jsonl", ""),
                                 "preview": preview,
@@ -762,7 +890,7 @@ def export_markdown(filepath):
 
 def export_html(filepath):
     """Export a session as standalone HTML."""
-    content, count, compact_total = render_session(filepath)
+    content, count, compact_total, total = render_session(filepath)
     sid = Path(filepath).stem
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -964,6 +1092,9 @@ code.ic { background: #30363d; padding: 1px 3px; border-radius: 3px; font-size: 
 
 /* Loading */
 .loading { text-align: center; color: #8b949e; margin-top: 60px; }
+.load-more-top { text-align: center; padding: 16px; }
+.load-more-top button { background: #1f6feb; color: #fff; border: none; padding: 8px 24px; border-radius: 6px; cursor: pointer; font-size: 0.9em; }
+.load-more-top button:hover { background: #388bfd; }
 
 /* Jump-to highlight — double blink */
 .entry.highlight-jump, .api-msg.highlight-jump { animation: doubleBlink 1s ease-out; }
@@ -1181,7 +1312,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(self.api_sessions(folder))
         elif path == "/api/view":
             file = params.get("file", [""])[0]
-            self.send_html_fragment(self.api_view(file))
+            offset = int(params.get("offset", ["0"])[0])
+            limit = int(params.get("limit", ["100"])[0])
+            self.send_html_fragment(self.api_view(file, offset=offset, limit=limit))
         elif path == "/api/apiview":
             file = params.get("file", [""])[0]
             self.send_html_fragment(self.api_apiview(file))
@@ -1312,43 +1445,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if os.path.isdir(full):
                     cnt = sum(1 for f in os.listdir(full) if f.endswith(".jsonl"))
                     if cnt > 0:
-                        readable = name.replace("-", "/")
+                        readable = decode_project_folder(name)
                         folders.append({"name": name, "readable": readable, "count": cnt})
         except Exception as e:
             return {"error": str(e)}
         return folders
 
     def api_sessions(self, folder):
-        sessions = []
+        from concurrent.futures import ThreadPoolExecutor
         folder_path = os.path.join(BASE_DIR, folder)
         if not os.path.isdir(folder_path):
             return {"error": "not found"}
-        jsonl_files = sorted(
-            [f for f in os.listdir(folder_path) if f.endswith(".jsonl")],
-            key=lambda f: os.path.getmtime(os.path.join(folder_path, f)),
-            reverse=True,
-        )
-        for fname in jsonl_files:
-            fpath = os.path.join(folder_path, fname)
+        # Use scandir for single-pass stat + sort
+        entries = []
+        try:
+            for e in os.scandir(folder_path):
+                if e.name.endswith(".jsonl") and e.is_file():
+                    entries.append((e.name, e.path, e.stat().st_mtime))
+        except Exception:
+            return []
+        entries.sort(key=lambda x: x[2], reverse=True)
+
+        # Parallel summary reads
+        def make_session(entry):
+            fname, fpath, _ = entry
             summary = get_session_summary(fpath)
-            sessions.append({
+            return {
                 "filename": fname,
                 "session_id": fname.replace(".jsonl", ""),
                 "path": fpath,
                 **summary,
-            })
+            }
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            sessions = list(pool.map(make_session, entries))
         return sessions
 
-    def api_view(self, filepath):
+    def api_view(self, filepath, offset=0, limit=100):
+        """Render session with pagination. Loads from the END (newest first).
+
+        offset=0 means the last `limit` records (newest).
+        offset=100 means skip the last 100, show the 100 before that, etc.
+        """
         if not filepath or not os.path.isfile(filepath):
             return '<div class="loading">File not found</div>'
         try:
-            content, count, compact_total = render_session(filepath)
+            # Fast line count via raw byte scan
+            with open(filepath, "rb") as fb:
+                total = fb.read().count(b"\n")
+            if total == 0:
+                total = 1
+
+            # Calculate real offset from the start of file
+            # offset=0 → show last `limit` records
+            # offset=100 → show records before the last 100
+            real_start = max(0, total - offset - limit)
+            real_limit = min(limit, total - offset)
+            if real_limit <= 0:
+                return ''
+
+            content, count, compact_total, _total = render_session(filepath, offset=real_start, limit=real_limit)
             sid = Path(filepath).stem
-            compact_bar = ""
-            if compact_total > 0:
-                compact_bar = f'<div class="compact-summary"><strong>Compact Content Detected:</strong> {compact_total} entries contain compressed/summarized content (purple border + corner marker)</div>'
-            return f'<div class="header"><h1>Session: {esc(sid[:20])}…</h1><div class="meta">{count} entries | {compact_total} compact | {esc(filepath)}</div></div>{compact_bar}{content}'
+
+            has_more = real_start > 0
+            more_btn = f'<div class="load-more-top" id="load-more-top" data-offset="{offset + limit}" data-file="{esc(filepath)}" data-total="{total}"><button onclick="loadOlder()">載入更早的記錄（已顯示 {min(offset + limit, total)}/{total}）</button></div>' if has_more else ''
+
+            if offset == 0:
+                # First load: header + newest records
+                compact_bar = ""
+                if compact_total > 0:
+                    compact_bar = f'<div class="compact-summary"><strong>Compact Content Detected:</strong> {compact_total} entries contain compressed/summarized content (purple border + corner marker)</div>'
+                header = f'<div class="header"><h1>Session: {esc(sid[:20])}…</h1><div class="meta">{total} entries | {esc(filepath)}</div></div>{compact_bar}'
+                return f'{header}{more_btn}{content}'
+            else:
+                # Loading older records: prepend before existing
+                return f'{more_btn}{content}'
         except Exception as e:
             return f'<div class="loading">Error: {esc(str(e))}</div>'
 
@@ -1425,6 +1596,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <script>
 let currentFolder = null;
 let currentFile = null;
+let secretsController = null;  // AbortController for secrets request
 
 async function loadFolders() {{
   const res = await fetch('/api/folders');
@@ -1438,7 +1610,7 @@ async function loadFolders() {{
     div.dataset.readable = f.readable;
     div.innerHTML = `
       <div class="folder-name" onclick="toggleFolder(this, '${{f.name}}')" title="${{f.readable}}">
-        ${{f.readable.split('/').pop() || f.readable}} <span style="color:#484f58;font-size:0.85em">(${{f.count}})</span>
+        ${{(() => {{ const segs = f.readable.split('/').filter(Boolean); return segs.length > 3 ? segs.slice(-3).join('/') : segs.join('/'); }})()}} <span style="color:#484f58;font-size:0.85em">(${{f.count}})</span>
       </div>
       <div class="sessions" id="sessions-${{f.name}}"></div>
     `;
@@ -1474,6 +1646,22 @@ async function toggleFolder(el, folder) {{
     `;
     sessDiv.appendChild(item);
   }});
+}}
+
+async function loadOlder() {{
+  const btn = document.getElementById('load-more-top');
+  if (!btn) return;
+  const offset = parseInt(btn.dataset.offset);
+  const file = btn.dataset.file;
+  btn.innerHTML = '<button disabled>載入中...</button>';
+  // Remember scroll position from bottom to stay in place after insert
+  const scrollBottom = document.body.scrollHeight - window.scrollY;
+  const res = await fetch('/api/view?file=' + encodeURIComponent(file) + '&offset=' + offset + '&limit=100');
+  const html = await res.text();
+  btn.outerHTML = html;
+  applyFilters();
+  // Restore scroll position (content was prepended above)
+  window.scrollTo(0, document.body.scrollHeight - scrollBottom);
 }}
 
 async function loadSession(filepath, el) {{
@@ -1526,6 +1714,8 @@ async function loadSession(filepath, el) {{
   `;
   applyFilters();
   checkSecrets();
+  // Scroll to bottom (newest messages) like LINE
+  window.scrollTo(0, document.body.scrollHeight);
 }}
 
 const activeFilters = new Set(['user', 'assistant', 'tool']);
@@ -1837,8 +2027,11 @@ function renderStats(data) {{
 // ─── Secrets Detection ───
 async function checkSecrets() {{
   if (!currentFile) return;
+  // Abort previous secrets request if still running
+  if (secretsController) secretsController.abort();
+  secretsController = new AbortController();
   try {{
-    const res = await fetch('/api/secrets?file=' + encodeURIComponent(currentFile));
+    const res = await fetch('/api/secrets?file=' + encodeURIComponent(currentFile), {{ signal: secretsController.signal }});
     const secrets = await res.json();
     const banner = document.getElementById('secret-banner');
     const badgeArea = document.getElementById('secret-badge-area');
@@ -2114,7 +2307,7 @@ async function doGlobalSearch(query) {{
         html += '<div class="search-result" onclick="loadSearchResult(\\x27' + escAttr(r.path) + '\\x27)">';
         html += '<div class="sr-header">';
         html += '<span class="sr-type ' + typeClass + '">' + escHtml(r.record_type) + '</span>';
-        html += '<span class="sr-folder">' + escHtml(r.folder.replace(/-/g, '/')) + '</span>';
+        html += '<span class="sr-folder">' + escHtml(r.readable_folder || r.folder) + '</span>';
         html += '<span class="sr-time">' + escHtml(r.timestamp) + '</span>';
         html += '</div>';
         html += '<div class="sr-preview">' + preview + '</div>';
@@ -2547,7 +2740,9 @@ loadFolders();
 
 
 def main():
-    server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+    class ThreadedServer(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+    server = ThreadedServer(("127.0.0.1", PORT), Handler)
     print(f"Session Viewer running at http://127.0.0.1:{PORT}")
     threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
     try:
@@ -2557,5 +2752,242 @@ def main():
         server.server_close()
 
 
+# ─── CLI Mode: Extract human messages for worklog ───
+
+def cli_extract(args):
+    """CLI mode: extract user messages filtered by date/project for worklog updates."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Extract human messages from Claude Code sessions for worklog.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  %(prog)s --since 2026-03-21 --project Auto_Claude
+  %(prog)s --since 2026-03-21 --until 2026-03-22 --human-only
+  %(prog)s --since 2026-03-21 --project Auto_Claude --summary
+  %(prog)s --days 2 --project 交通部 --human-only --max-len 100""",
+    )
+    parser.add_argument("--since", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--until", help="End date exclusive (YYYY-MM-DD)")
+    parser.add_argument("--days", type=int, help="Last N days (alternative to --since)")
+    parser.add_argument("--hours", type=int, help="Last N hours (alternative to --since)")
+    parser.add_argument("--project", help="Filter by project path substring (e.g. Auto_Claude, 交通部)")
+    parser.add_argument("--human-only", action="store_true", help="Only show human/user messages")
+    parser.add_argument("--no-compact", action="store_true", help="Exclude compact/continuation messages")
+    parser.add_argument("--no-auto", action="store_true", help="Exclude automated sessions (curator/dev prompts)")
+    parser.add_argument("--max-len", type=int, default=200, help="Max chars per message (default 200)")
+    parser.add_argument("--summary", action="store_true", help="Group by session, show counts + first message only")
+    parser.add_argument("--full", action="store_true", help="No truncation, show full messages")
+    parsed = parser.parse_args(args)
+
+    # Determine time range
+    now = datetime.now(TW)
+    if parsed.days:
+        since_dt = now - timedelta(days=parsed.days)
+    elif parsed.hours:
+        since_dt = now - timedelta(hours=parsed.hours)
+    elif parsed.since:
+        since_dt = datetime.strptime(parsed.since, "%Y-%m-%d").replace(tzinfo=TW)
+    else:
+        since_dt = now - timedelta(days=1)
+
+    if parsed.until:
+        until_dt = datetime.strptime(parsed.until, "%Y-%m-%d").replace(tzinfo=TW)
+    else:
+        until_dt = now + timedelta(days=1)
+
+    auto_patterns = [
+        '你是 AI 審查者（Reviewer）',
+        '你是接手的開發者',
+        '規則：1. 直接動手做事',
+        '你是 AI 決策代理',
+    ]
+
+    max_len = None if parsed.full else parsed.max_len
+    results = []  # (project_short, session_id, messages)
+
+    base = Path(BASE_DIR)
+    for jsonl in sorted(base.rglob("*.jsonl")):
+        # Skip subagent files
+        if "subagents" in str(jsonl):
+            continue
+
+        # Derive short project name from directory
+        rel = str(jsonl.relative_to(base))
+        proj_dir = rel.split("/")[0]
+
+        # Decode Claude's path encoding
+        # -Users-henry-Desktop----Auto-Claude -> ~/Desktop/公司/Auto_Claude
+        # Non-ASCII chars become dashes, / becomes -
+        # Known mappings for this machine:
+        PROJ_MAP = {
+            "-Users-henry-Desktop----AI-----": "~/Desktop/公司/AI交通部客服",
+            "-Users-henry-Desktop----Auto-Claude": "~/Desktop/公司/Auto_Claude",
+            "-Users-henry-Desktop----myReAct": "~/Desktop/公司/myReAct",
+        }
+        proj_short = PROJ_MAP.get(proj_dir, "")
+        if not proj_short:
+            proj_short = proj_dir
+            if proj_short.startswith("-Users-henry"):
+                proj_short = "~/" + proj_short[len("-Users-henry-"):]
+                # Clean up remaining multi-dashes (Chinese chars)
+                proj_short = re.sub(r'-{3,}', '/…/', proj_short)
+            # Single dashes in path segments are actual separators (AI-Auto-research -> AI/Auto_research)
+            # But keep as-is since it's readable enough
+
+        # Project filter: match against both encoded dir name and decoded name
+        if parsed.project:
+            query = parsed.project.lower().replace("_", "").replace("-", "").replace("/", "")
+            target_raw = proj_dir.lower().replace("_", "").replace("-", "").replace("/", "")
+            target_nice = proj_short.lower().replace("_", "").replace("-", "").replace("/", "")
+            if query not in target_raw and query not in target_nice:
+                continue
+        session_id = jsonl.stem[:8]
+
+        try:
+            messages = []
+            first_user_text = ""
+            is_auto = False
+
+            # First pass: check if session is automated by reading first user message (regardless of time filter)
+            with open(jsonl) as f:
+                for line in f:
+                    r = json.loads(line)
+                    if r.get("type") == "user":
+                        msg = r.get("message", {})
+                        c = msg.get("content", "")
+                        if isinstance(c, list):
+                            c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+                        first_check = str(c)[:500]
+                        if first_check.strip():
+                            for pat in auto_patterns:
+                                if pat in first_check:
+                                    is_auto = True
+                                    break
+                            break
+
+            if parsed.no_auto and is_auto:
+                continue
+
+            # Second pass: extract messages within time range
+            with open(jsonl) as f:
+                for line in f:
+                    r = json.loads(line)
+                    ts_str = r.get("timestamp", "")
+                    if not ts_str:
+                        continue
+
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(TW)
+                    except Exception:
+                        continue
+
+                    if dt < since_dt or dt >= until_dt:
+                        continue
+
+                    rtype = r.get("type", "")
+
+                    # Extract text content
+                    text = ""
+                    if rtype == "user":
+                        msg = r.get("message", {})
+                        c = msg.get("content", "")
+                        if isinstance(c, list):
+                            parts = []
+                            for block in c:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                            text = "\n".join(parts)
+                        elif isinstance(c, str):
+                            text = c
+
+                        if not first_user_text and text.strip():
+                            first_user_text = text[:500]
+
+                    elif rtype == "assistant" and not parsed.human_only:
+                        msg = r.get("message", {})
+                        c = msg.get("content", "")
+                        if isinstance(c, list):
+                            parts = []
+                            for block in c:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    parts.append(block.get("text", ""))
+                            text = "\n".join(parts)
+                        elif isinstance(c, str):
+                            text = c
+                    else:
+                        continue
+
+                    if not text or not text.strip():
+                        continue
+
+                    # Skip compact messages
+                    if parsed.no_compact and detect_compact(text):
+                        continue
+
+                    # Skip local-command-caveat, bash-input, etc
+                    if text.strip().startswith("<local-command-caveat>"):
+                        continue
+                    if text.strip().startswith("<bash-"):
+                        continue
+
+                    time_str = dt.strftime("%m/%d %H:%M")
+                    role = "human" if rtype == "user" else "ai"
+
+                    # Truncate
+                    display = text.strip().replace("\n", " ")
+                    if max_len and len(display) > max_len:
+                        display = display[:max_len] + "..."
+
+                    messages.append((time_str, role, display))
+
+            if not messages:
+                continue
+            if parsed.no_auto and is_auto:
+                continue
+
+            results.append((proj_short, session_id, is_auto, messages, first_user_text))
+
+        except Exception:
+            continue
+
+    if not results:
+        print("No matching sessions found.")
+        return
+
+    if parsed.summary:
+        # Summary mode: one line per session
+        print(f"{'Date':>11}  {'Proj':<35} {'Msgs':>5}  {'Auto':>4}  First message")
+        print("─" * 110)
+        for proj, sid, is_auto, msgs, first_text in results:
+            human_count = sum(1 for _, r, _ in msgs if r == "human")
+            first_time = msgs[0][0] if msgs else ""
+            preview = first_text.strip().replace("\n", " ")[:80] if first_text else ""
+            auto_tag = " 🤖" if is_auto else ""
+            print(f"{first_time:>11}  {proj:<35} {human_count:>5}  {auto_tag:>4}  {preview}")
+    else:
+        # Full mode: show all messages
+        for proj, sid, is_auto, msgs, _ in results:
+            auto_tag = " [AUTO]" if is_auto else ""
+            print(f"\n{'═' * 80}")
+            print(f"  {proj}  ({sid}){auto_tag}")
+            print(f"{'─' * 80}")
+            for time_str, role, display in msgs:
+                tag = "👤" if role == "human" else "🤖"
+                print(f"  {time_str} {tag} {display}")
+
+    # Print stats
+    total_sessions = len(results)
+    auto_sessions = sum(1 for _, _, a, _, _ in results if a)
+    manual_sessions = total_sessions - auto_sessions
+    total_human_msgs = sum(sum(1 for _, r, _ in msgs if r == "human") for _, _, _, msgs, _ in results)
+    print(f"\n{'─' * 40}")
+    print(f"  Sessions: {total_sessions} ({manual_sessions} manual, {auto_sessions} auto)")
+    print(f"  Human messages: {total_human_msgs}")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        cli_extract(sys.argv[2:])
+    else:
+        main()
